@@ -1,0 +1,205 @@
+library(pscl)
+library(MASS)
+library(car) 
+library(glmnet)
+mydata<-readxl::read_xlsx("data.xlsx")
+####### univariate analysis ########
+nb_reg <- function(x) {
+  tryCatch({
+    model <- glm.nb(case ~ x, data = mydata)
+    summary(model)$coefficients[2, c(1, 2, 4)]
+  }, error = function(e) {
+    return(c(NA, NA, NA))  
+  })
+}
+result<-t(apply(mydata[,c(9:37)],2,nb_reg)) 
+IRR<-exp(result[,1])
+IRRlow<-exp(result[,1]-1.96*result[,2])
+IRRhigh<-exp(result[,1]+1.96*result[,2])
+pvalue<-result[,3]
+result1<-data.frame(IRR,IRRlow,IRRhigh,pvalue)
+result1
+
+####### lasso regression #######
+library(glmnet)
+cv_fit <- cv.glmnet(x, y, alpha = 1)  
+best_alpha <- cv_fit$lambda.min  
+
+alpha_values <- seq(0, 1, by = 0.1)
+results <- sapply(alpha_values, function(alpha) {
+  fit <- glmnet(x, y, alpha = alpha)
+  cv_fit <- cv.glmnet(x, y, alpha = alpha)
+  return(cv_fit$cvm[cv_fit$lambda == cv_fit$lambda.min])
+})
+best_alpha <- alpha_values[which.min(results)] # best_alpha=0.8
+
+lasso_model <- cv.glmnet(x, y, family = "poisson", alpha = 0.8)  
+plot(lasso_model)  
+
+best_lambda <- lasso_model$lambda.min  
+selected_vars <- coef(lasso_model, s = best_lambda)  
+print(selected_vars)  #Tea_group, Sh_IQR, pop_den_IQR, water_IQR, solar_IQR, rh2_IQR 
+
+#### Multivariate negative binomial regression ####
+summary(glm.nb(case ~ Tea_group +Sh_IQR+pop_den_IQR+ water_IQR+solar_IQR+rh2_IQR,data=mydata10_19))
+
+######### Machine learning #########
+#######Random Forest ##########
+library(ranger)
+set.seed(2025) ###### 
+rf_model <- ranger(
+  formula = case ~Tea_v17 +Sh+pop_den+ water+solar+rh2,
+  data = mydata,
+  num.trees = 500,
+  importance = "permutation",  #
+  mtry = 3    
+)
+rf_model
+
+importance_values <- rf_model$variable.importance
+importance_df <- data.frame(
+  Variable = names(importance_values),
+  Importance = as.numeric(importance_values)
+)
+importance_df <- importance_df[order(-importance_df$Importance), ]
+
+library(ggplot2)
+importance_df$group<-c("Yes", "no","no","no","no","no")
+importance_df$CATE<-c("Tea plantation", "Relative humidity","Population density","Sheep density","Solar radiation", "Water")
+
+p_rf <- ggplot(importance_df, aes(x = reorder(CATE, Importance), y = Importance)) +
+  geom_col(aes(fill = group), width = 0.6) +
+  scale_fill_manual(values = c("no" = "#3b4992", "Yes" = "#ee0000")) +
+  coord_flip() +  
+  labs(
+    title = "(A) Random forest",
+    x = "Variables",
+    y = "Importance"
+  ) +
+  theme_bw() +  
+  theme(
+    axis.text.x = element_text(size = 12) , 
+    axis.text.y = element_text(size = 12, angle = 45, hjust = 1),  
+    legend.position = "none"  
+  )
+##### Xgboost #########
+library(xgboost)
+library(SHAPforxgboost)
+
+xgb_data <- xgb.DMatrix(
+  data = model.matrix(~ Tea_v17 + Sh + pop_den + water + solar + rh2 -1, data = mydata),
+  label = mydata$case
+)
+
+#########Early Stopping ###
+xgb_model1 <- xgb.train(
+  data = xgb_data,
+  nrounds = 1000,  
+  watchlist = list(train = xgb_data),
+  early_stopping_rounds = 5
+)########nrounds=144
+
+xgb_model <- xgb.train(
+  data = xgb_data,
+  params = list(objective = "reg:squarederror"),
+  nrounds = 144
+)
+
+xgb.importance(model = xgb_model) -> imp_xgb
+imp_xgb
+imp_xgb$group<-c("Yes", "no","no","no","no","no")
+imp_xgb$CATE<-c("Tea plantation","Solar radiation","Sheep density","Population density", "Water","Relative humidity")
+
+imp_xgb%>%
+  ggplot(aes(x =reorder(CATE, Gain), y = Gain)) +
+  geom_col(aes(fill = group), width = 0.6) +
+  scale_fill_manual(values = c("no" = "#3b4992", "Yes" = "#ee0000")) +
+  coord_flip() +  
+  labs(
+    title = "(B) XGBoost",
+    x = "Variables",
+    y = "Gain"
+  ) +
+  theme_bw() +  
+  theme(
+    axis.text.x = element_text(size = 12) , 
+    axis.text.y = element_text(size = 12, angle = 45, hjust = 1), 
+    legend.position = "none"  
+  ) -> p_xgb
+
+##### based on SHAPforxgboost #####
+X = model.matrix(~ Tea_v17 + Sh + pop_den + water + solar + rh2 -1, data = mydata) 
+colnames(X) <- c(
+  "Tea plantation", 
+  "Sheep density", 
+  "Population density", 
+  "Water", 
+  "Solar radiation", 
+  "Relative humidity"）
+
+xgb_data <- xgb.DMatrix(
+  data = X,
+  label = mydata$case
+)
+
+xgb_model <- xgb.train(
+  data = xgb_data,
+  params = list(objective = "reg:squarederror"),
+  nrounds = 144
+)
+shap = shap.prep(xgb_model,X_train=X) 
+p_SHAP<-shap.plot.summary(shap) 
+p_SHAP_bar<-shap.plot.summary(shap, kind = "bar")
+
+################ Corrlation analysis #########
+data1<-readxl::read_xlsx("tick.xlsx")
+cor.test(data1$density_h,data1$Tea_v17) 
+cor.test(data1$density_h,data1$case) 
+
+library(hrbrthemes)
+library(ggthemes)
+a<-ggplot(data2, aes(x = Tea_v17, y = density_adult)) +
+  geom_point(fill="#3b4992",colour="white",size=3,shape=21) +  
+  geom_smooth(method = "lm", se = T, colour="#ee0000")+theme_bw()+
+  labs( x="Tea plantation (hectare)", y="Adult tick density (ticks/flag-hour)")+
+  scale_x_continuous(breaks = c(0, 1000,2000,3000, 4000))+
+  theme(axis.text = element_text(size = 12),  
+        axis.title.x = element_text(size = 14),  
+        axis.title.y = element_text(size = 14))  
+
+b<-ggplot(data2, aes(x = density_adult, y = case)) +
+  geom_point(fill="#3b4992",colour="white",size=3,shape=21) +  
+  geom_smooth(method = "lm", se = T, colour="#ee0000")+theme_bw()+
+  labs( x="Adult tick density (ticks/flag-hour)", y="SFTS cases")+
+  scale_x_continuous(breaks = c(0, 10,20))+
+  theme(axis.text = element_text(size = 12),  
+        axis.title.x = element_text(size = 14),  
+        axis.title.y = element_text(size = 14))  
+################ mediation of tick density #########
+############ tea planation→tick density→SFTS ######
+model_mediator1 <- lm(density_adult ~ Tea_v17+Sh + pop_den + water + solar + rh2, data = data1)
+model_outcome1 <- lm(case ~ Tea_v17+ density_adult+Sh + pop_den + water + solar + rh2 , data = data1) 
+summary(model_mediator1)
+summary(model_outcome1)
+
+set.seed(1234)
+med_result1 <- mediate(
+  model_mediator1, model_outcome1,
+  treat = "Tea_v17", mediator = "density_adult",
+  boot = TRUE, sims = 1000
+)
+summary(med_result1) 
+
+############ tick density→tea planation→SFTS ######
+model_mediator2 <- lm(Tea_v17 ~ density_adult+Sh + pop_den + water + solar + rh2, data = data1)
+model_outcome2 <- lm(case ~ Tea_v17+ density_adult+Sh + pop_den + water + solar + rh2, data = data1)
+summary(model_mediator2)
+summary(model_outcome2)
+
+set.seed(1234)
+med_result <- mediate(
+  model_mediator2, model_outcome2,
+  treat = "density_adult", mediator = "Tea_v17",
+  boot = TRUE, sims = 1000
+)
+summary(med_result2) 
